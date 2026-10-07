@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -49,7 +50,12 @@ def _safe_error_code(value: str) -> str:
 
 
 def stable_event_id(transcription: str, recorded_at: str, client: str) -> str:
-    """Return the stable identity for one normalized source event."""
+    """Return the private duplicate-suppression key for one normalized event.
+
+    This is an unsalted hash of the speech, so it must stay inside the private
+    SQLite file (``events.identity``).  It is never a public receipt or payload
+    identifier because short or predictable speech could be guessed from it.
+    """
 
     text = _normalise(transcription, "transcription")
     recorded = _normalise(recorded_at, "recorded_at")
@@ -219,7 +225,10 @@ class Store:
         text = _normalise(transcription, "transcription")
         recorded = _normalise(recorded_at, "recorded_at")
         source_client = _normalise(client, "client")
-        event_id = stable_event_id(text, recorded, source_client)
+        identity = stable_event_id(text, recorded, source_client)
+        # The public ID is random and only meaningful once the row commits; a
+        # duplicate discards it and returns the receipt stored on first intake.
+        event_id = secrets.token_hex(32)
         payload = self._payload(text, recorded, source_client, event_id)
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         payload_bytes = len(payload_json.encode("utf-8"))
@@ -227,7 +236,6 @@ class Store:
             raise QueueFull("queue byte capacity reached")
 
         now = self._now()
-        identity = event_id
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -293,6 +301,50 @@ class Store:
                 "SELECT * FROM events ORDER BY sequence DESC LIMIT ?", (bounded_limit,)
             ).fetchall()
         return [self._metadata(row) for row in rows]
+
+    def head(self) -> dict[str, Any] | None:
+        """Return metadata for the oldest undelivered event, if any.
+
+        This is the event ``claim_next`` considers first, so a blocked
+        ``needs_attention`` head stays visible however many newer captures
+        arrive behind it.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM events WHERE status <> 'delivered' ORDER BY sequence LIMIT 1"
+            ).fetchone()
+        return None if row is None else self._metadata(row)
+
+    def capacity(self) -> dict[str, Any]:
+        """Return configured limits, current usage and remaining headroom.
+
+        The limits are deliberate backpressure: nothing is pruned or rotated
+        automatically, and intake answers 503 once any limit is reached.
+        """
+
+        with self._connect() as connection:
+            records, pending, used_bytes = connection.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(status IN
+                           ('queued', 'sending', 'retry', 'needs_attention')), 0),
+                       COALESCE(SUM(payload_bytes), 0)
+                FROM events
+                """
+            ).fetchone()
+        limits = {
+            "maxPending": self.max_pending,
+            "maxRecords": self.max_records,
+            "maxBytes": self.max_bytes,
+        }
+        current = {"pending": pending, "records": records, "bytes": used_bytes}
+        remaining = {
+            "pending": max(0, self.max_pending - pending),
+            "records": max(0, self.max_records - records),
+            "bytes": max(0, self.max_bytes - used_bytes),
+        }
+        return {"limits": limits, "current": current, "remaining": remaining}
 
     def counts(self) -> dict[str, int]:
         with self._connect() as connection:
