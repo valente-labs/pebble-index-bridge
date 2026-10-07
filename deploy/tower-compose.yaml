@@ -1,11 +1,9 @@
 services:
   index-bridge:
-    build: .
+    image: ${INDEX_BRIDGE_IMAGE:?set INDEX_BRIDGE_IMAGE to an immutable image reference}
     restart: unless-stopped
     init: true
     user: "10001:10001"
-    ports:
-      - "127.0.0.1:8000:8000"
     environment:
       BRIDGE_TOKEN_FILE: /run/secrets/bridge_token
       GROKBOT_WEBHOOK_URL_FILE: /run/secrets/grokbot_webhook_url
@@ -25,7 +23,7 @@ services:
       - grokbot_webhook_url
       - grokbot_webhook_key
     volumes:
-      - index-bridge-data:/data
+      - ${INDEX_BRIDGE_DATA_DIR:?set INDEX_BRIDGE_DATA_DIR to a dedicated private data directory}:/data
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -48,9 +46,16 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+    networks:
+      bridge:
+        ipv4_address: ${INDEX_BRIDGE_ADDRESS:-172.16.242.2}
 
-volumes:
-  index-bridge-data:
+networks:
+  bridge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${INDEX_BRIDGE_SUBNET:-172.16.242.0/29}
 
 secrets:
   bridge_token:
