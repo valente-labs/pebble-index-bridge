@@ -170,23 +170,15 @@ def snapshot(ssh: Ssh, root: str, image: str, now: datetime) -> str:
         "import sqlite3,sys;c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True);"
         "sys.exit(0 if c.execute('PRAGMA integrity_check').fetchone()[0]=='ok' else 1)"
     )
-    try:
-        ssh(f"{prefix} python scripts/queue_admin.py backup /data/{q(name)}")
-        ssh(f"{prefix} python -c {q(check)} /data/{q(name)}")
-        ssh(
-            f"umask 077; set -C; mkdir -p {q(target_dir)} && test ! -e {q(target)} "
-            f"&& cat {q(source)} > {q(target)} && cmp -s {q(source)} {q(target)} "
-            f"&& test -s {q(target)} && rm -f {q(source)}"
-        )
-    except BaseException:
-        # An existing archive must survive every failure, including a collision.
-        # A partial newly created archive remains private for operator inspection.
-        for leftover in (source,):
-            try:
-                ssh(f"rm -f {q(leftover)}")
-            except Exception:
-                pass
-        raise
+    # A refused destination or lost SSH acknowledgement must never trigger
+    # deletion of an existing backup. Failed copies stay private for inspection.
+    ssh(f"{prefix} python scripts/queue_admin.py backup /data/{q(name)}")
+    ssh(f"{prefix} python -c {q(check)} /data/{q(name)}")
+    ssh(
+        f"umask 077; set -C; mkdir -p {q(target_dir)} && test ! -e {q(target)} "
+        f"&& cat {q(source)} > {q(target)} && cmp -s {q(source)} {q(target)} "
+        f"&& test -s {q(target)} && rm -f {q(source)}"
+    )
     return target
 
 
@@ -342,6 +334,14 @@ def main() -> None:
                 failed.append(step)
 
         # Undo in reverse order; only this service's single Serve route is ever touched.
+        if "pointer" in touched:
+            attempt(
+                "pointer",
+                f"umask 077; printf %s {q(old)} > {q(pointer + '.new')} "
+                f"&& mv {q(pointer + '.new')} {q(pointer)}"
+                if old
+                else f"rm -f {q(pointer)} {q(pointer + '.new')}",
+            )
         if "marker" in touched:
             attempt(
                 "marker",

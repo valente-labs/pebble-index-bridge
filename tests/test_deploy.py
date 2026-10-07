@@ -39,9 +39,23 @@ def test_snapshot_collision_never_removes_an_existing_archive():
     with pytest.raises(RuntimeError, match="existing archive"):
         deploy.snapshot(ssh, ROOT, "image", datetime(2026, 1, 1, tzinfo=UTC))
     cleanup = [command for command in commands if command.startswith("rm -f")]
-    assert len(cleanup) == 1
-    assert "/data/.pre-deploy-" in cleanup[0]
-    assert "/archive/" not in cleanup[0]
+    assert cleanup == []
+
+
+def test_failed_backup_does_not_remove_refused_existing_destination():
+    commands = []
+
+    def ssh(command, data=None):
+        commands.append(command)
+        if command.startswith("docker ps"):
+            return b"container-id"
+        if "queue_admin.py backup" in command:
+            raise RuntimeError("destination already exists")
+        return b""
+
+    with pytest.raises(RuntimeError, match="destination already exists"):
+        deploy.snapshot(ssh, ROOT, "image", datetime(2026, 1, 1, tzinfo=UTC))
+    assert not any(command.startswith("rm ") for command in commands)
 
 
 def setup(monkeypatch, tmp_path, cfg, action="apply", port="8449"):
@@ -287,6 +301,32 @@ def test_failed_first_deploy_removes_only_new_route_and_keeps_data(monkeypatch, 
     assert any(c.endswith(" stop") for c in cmds)
     assert f"rm -f '{ROOT}/serve-owner'" in cmds or f"rm -f {ROOT}/serve-owner" in cmds
     assert not any(" down" in c or ("rm -rf" in c and "/data" in c) for c in cmds)
+
+
+@pytest.mark.parametrize("prior", [PRIOR, ""])
+def test_pointer_rollback_after_remote_success_with_lost_ack(monkeypatch, tmp_path, prior):
+    setup(monkeypatch, tmp_path, config())
+    tower = Tower(secrets=good_secrets(), prior=prior)
+    lost_ack = False
+
+    def run(args, data=None):
+        nonlocal lost_ack
+        result = tower(args, data)
+        command = args[-1]
+        if args[0] == "ssh" and "current-release.new" in command:
+            if not lost_ack:
+                tower.prior = "new-release-was-written"
+                lost_ack = True
+                raise RuntimeError("SSH acknowledgement lost")
+            tower.prior = prior
+        if args[0] == "ssh" and command.startswith("rm -f") and "current-release" in command:
+            tower.prior = ""
+        return result
+
+    monkeypatch.setattr(deploy, "run", run)
+    with pytest.raises(RuntimeError, match="acknowledgement lost"):
+        deploy.main()
+    assert tower.prior == prior
 
 
 @pytest.mark.parametrize(
