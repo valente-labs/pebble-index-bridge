@@ -16,20 +16,31 @@ receiving Grok Bot is a separate security and execution boundary.
 - Use HTTPS for the bridge endpoint and for `GROKBOT_WEBHOOK_URL`. Do not use
   URL userinfo or fragments. Keep the bridge bound to localhost behind the
   chosen HTTPS front end.
-- The service never logs raw transcriptions. Logs, metrics, backups, and support bundles
-  may contain timestamps and event IDs, but should not contain speech or
-  credentials.
+- The service never logs raw transcriptions. Logs, metrics, status output, and
+  support bundles may contain timestamps, event IDs, counts, and error codes.
+  They must never contain raw speech or credentials.
+- The database holds every accepted transcription in full, so every backup of
+  it holds the transcriptions too. Backups must stay private: mode 0600, a
+  private location, encrypted storage, and never attached to a ticket, chat, or
+  support bundle. Treat a backup exactly like the live database.
 - Mount `/data` as a private persistent volume. The store creates restrictive
   database and directory modes, but host backup and volume permissions remain
   operator responsibilities.
 
 ## Event and delivery safety
 
-The bridge derives one stable event identity from normalized transcription,
-`recordedAt`, and `client`. SQLite uniqueness makes duplicate intake return the
-existing receipt. This is local deduplication only. The Grok webhook contract
-does not document an idempotency key, duplicate suppression, ordering, or a
-completion callback.
+The public event ID in a receipt is random and reveals nothing about the
+content. Duplicate suppression uses a separate private stable hash of the
+normalized transcription, `recordedAt`, and `client`. SQLite uniqueness on that
+hash makes a repeated submission return the existing receipt (same public ID,
+`duplicate: true`) instead of queueing a second copy. The hash stays inside the
+database: it is not returned by any endpoint, shown by the operator tool, or
+logged, so a leaked ID cannot be used to test guesses about what was said.
+
+`recordedAt` must be exactly 13 ASCII digits. It is forwarded to Grok as a JSON
+number. This is local deduplication only. The Grok webhook contract does not
+document an idempotency key, duplicate suppression, ordering, or a completion
+callback.
 
 The queue therefore uses conservative states:
 
@@ -55,20 +66,32 @@ review and records the maintained fork's control or remaining responsibility.
 | --- | --- | --- |
 | Example bearer token could be deployed unchanged | Configuration rejects obvious placeholder values; the example uses a missing secret-file path and an invalid HTTPS URL sentinel | Operators must generate unique secrets and verify startup fails before exposure when sentinels remain |
 | Unauthenticated traffic could grow failure state and logs | Failure accounting is bounded; rejection logs aggregate counters; request size and rate limits are bounded | Put an edge or reverse-proxy rate limit in front of any public endpoint; a public service can still be denied service by traffic volume |
-| Declared body length was not an intrinsic streamed cap | Intake consumes the ASGI body with a byte cap and rejects conflicting framing; multipart fields and part sizes are bounded | Keep the tested server/parser configuration and retest after proxy or server changes |
+| Declared body length was not an intrinsic streamed cap | Intake consumes the ASGI body with a byte cap and rejects conflicting framing; multipart fields and part sizes are bounded. `tests/test_wire.py` checks this over a real loopback uvicorn socket: chunked bodies over the cap, `Content-Length` with `Transfer-Encoding`, repeated framing headers, truncated and malformed multipart, and credentials checked before any body arrives | Keep the tested server/parser configuration and retest after proxy or server changes |
 | Excess authenticated requests could create one alert task each | This fork has no per-request outbound security-alert task path; the worker and queue are bounded | External monitoring should detect host or container exhaustion |
 | Numeric environment values could fail open | Integer, timeout, URL, host, and secret validation use finite bounds and fail startup on invalid values | Review new settings in code and deployment checks before enabling them |
 | Missing downstream URL could start the service | Destination URL and key are required, HTTPS-only, and validated at startup | Operators still control the destination; protect the environment and deployment plan |
 | Broad parser catches hid server failures | Expected multipart errors become client errors; unexpected exceptions are not silently relabeled as malformed input | Monitor application errors and dependency changes |
 | Malformed non-ASCII authorization could become an internal error | Header decoding and exact bearer comparison fail closed before form parsing | Keep an HTTPS edge that rejects malformed headers consistently |
 | Mutable or incomplete build inputs | Pin and review dependency inputs in CI; run the repository security checks before deployment | A base image, package index, or action can drift unless the release process pins and promotes an immutable artifact |
-| No durable delivery, replay, or restart recovery | SQLite WAL/FULL sync, append-only event history, persistent `/data`, worker recovery, and operator reconciliation preserve accepted events | A lost database or deleted volume is still data loss; make backups and test restore |
-| Timeout or response loss could duplicate a source event | Stable local identity deduplicates repeated Pebble submissions; ambiguous outcomes become `needs_attention` and are not auto-resubmitted | Grok may have accepted an ambiguous request. Human reconciliation is required |
+| No durable delivery, replay, or restart recovery | SQLite WAL/FULL sync, append-only event history, persistent `/data`, worker recovery, and operator reconciliation preserve accepted events | A lost database or deleted volume is still data loss; make private backups (which contain transcriptions) and test restore into a new file |
+| Timeout or response loss could duplicate a source event | The private stable hash deduplicates repeated Pebble submissions and the same receipt is returned; ambiguous outcomes become `needs_attention` and are not auto-resubmitted | Grok may have accepted an ambiguous request. Human reconciliation is required |
 | Concurrent forwarding could reorder utterances | One worker claims one FIFO head at a time; an attention head blocks later events | Grok routine execution and specialist work can still complete asynchronously after acceptance |
 | Shutdown could kill an in-flight delivery | `sending` is recovered as `needs_attention` after restart; deployment should allow the configured request timeout to drain | Never infer failure from a missing local response; inspect the owning routine before retrying |
 | Provider status contract was unclear | The Grok integration treats only HTTP 200 as acceptance and records the status | Grok documents acceptance, not completion. A future provider change requires an explicit contract update |
 | Health check could overstate readiness | `/health` reports store and worker availability; it does not claim Grok task completion | Treat delivery counts and attention state as separate operational signals |
 | Narrow multipart contract could drift with Pebble | Docs pin the baseline to transcription-only `transcription`, `recordedAt`, and `client` fields and reject files/unknown fields | Pebble app versions can change. Re-test the documented payload before enabling new modes |
+
+## Stored data and capacity
+
+Accepted events and their history are never deleted by the bridge. The record
+and byte limits count delivered events too, so a long-running deployment can
+reach `MAX_RECORDS` or `MAX_BYTES`. When any limit is reached, intake answers
+HTTP 503 and logs a capacity event; nothing already accepted is removed or
+overwritten. This favors keeping accepted speech over accepting new speech. Operator status reports the oldest unfinished
+head event and how much of each capacity limit is in use, so a stuck head or a
+filling store is visible before intake stops. The maintenance steps are in
+[`deployment.md`](deployment.md#capacity-maintenance). No step deletes data
+automatically.
 
 ## Bearer identity risk
 

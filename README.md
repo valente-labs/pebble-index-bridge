@@ -23,9 +23,22 @@ forwards this JSON shape to the configured Grok Bot routine:
 }
 ```
 
-The bridge uses one bearer token for Pebble and keeps the separate Grok
-webhook key on the server. It does not store or expose conversation text from
-status endpoints. Transcription logging is disabled by default.
+The bridge uses one bearer token for the Ring caller (Pebble) and keeps the
+separate Grok webhook key on the server. The Grok key never goes to Pebble.
+
+## Privacy
+
+Every accepted transcription is stored in full in the SQLite database so it
+can be delivered, reconciled, and kept as history. The database file and
+every backup of it therefore contain the transcriptions. They must stay
+private: restrictive file modes, a private volume, encrypted and access
+controlled backup storage, and never attached to a ticket, chat, or support
+bundle.
+
+Status endpoints, the operator `status` output, logs, metrics, and support
+bundles carry only metadata such as event IDs, states, counts, timestamps, and
+error codes. They never carry raw speech or credentials. Share those, not the
+database or a backup, when asking for help.
 
 ## Supported contract
 
@@ -36,10 +49,21 @@ status endpoints. Transcription logging is disabled by default.
 - `Authorization: Bearer <bridge token>` is required on every intake request.
 - The queue is durable SQLite at `DB_PATH`, with a persistent volume required
   for container deployments.
-- Event identity is stable for normalized transcription, `recordedAt`, and
-  `client`. Re-sending the same source event returns the existing receipt.
+- `recordedAt` must be exactly 13 ASCII digits (Unix milliseconds). The
+  bridge forwards it to Grok as a JSON number, not a string.
+- The public event ID in a receipt is random and carries no content. A
+  separate private hash of the normalized transcription, `recordedAt`, and
+  `client` decides whether an event is a duplicate. Re-sending the same source
+  event returns the same receipt with `duplicate: true` and does not queue a
+  second copy. The private hash is never returned or logged.
+- Intake answers HTTP `202` only after the event is durable in SQLite.
 - Delivery is FIFO. A `needs_attention` event stops later events until an
   operator reconciles it.
+- Capacity limits (`MAX_PENDING`, `MAX_RECORDS`, `MAX_BYTES`) make intake
+  answer HTTP `503` when reached. The bridge never deletes an accepted event or
+  its history to make room. Delivered events still count toward the record and
+  byte limits. See the capacity section of
+  [`docs/deployment.md`](docs/deployment.md).
 - A connection failure before a request is sent may receive bounded retry.
   Timeouts, cancellations, process restarts, and other ambiguous outcomes do
   not auto-resend because the downstream may already have accepted the body.
@@ -64,21 +88,27 @@ idempotency guarantee or a completion callback.
    history. Store the URL in `GROKBOT_WEBHOOK_URL_FILE` as well.
 3. Give the service a persistent private directory mounted at `/data` and set
    `DB_PATH=/data/index-bridge.sqlite3`.
-4. Run the deployment checks and review the generated plan:
+4. Validate and start the service on the local Docker host:
 
    ```bash
    docker compose --env-file .env config --quiet
    docker compose --env-file .env up -d --build --wait
    ```
 
-   For remote SSH deployment, use `scripts/deploy.py apply` with host, root and configuration arguments. Read `python3 scripts/deploy.py --help`
-   for the current options.
+   For a remote host over SSH, `scripts/deploy.py` takes the action
+   (`check`, `plan`, or `apply`) as a positional argument and requires
+   `--ssh-host`, `--remote-root`, and `--config`. Run `check`, then `plan`,
+   then `apply`. That helper uses the Compose project name `pebble-grok`, so
+   later operator commands on that host must use the same project. See
+   [`docs/deployment.md`](docs/deployment.md).
 5. Configure Pebble's webhook to the bridge's HTTPS `/index` URL, add the
    `Authorization` custom header with the bridge token, and select
    **transcription only**. Send a synthetic event first, then a short test
    recording.
-6. Use `python3 scripts/queue_admin.py --help` for queue inspection and reconciliation.
-   Resolve the head event before retrying later events.
+6. Use `scripts/queue_admin.py` inside the container for `status`, `backup`,
+   and `resolve`. It has no remote interface. Resolve the head event before
+   retrying later events. Exact commands for both deployment styles are in
+   [`docs/deployment.md`](docs/deployment.md).
 
 The complete generic deployment and private-network guidance is in
 [`docs/deployment.md`](docs/deployment.md). The control and audit matrix is in
