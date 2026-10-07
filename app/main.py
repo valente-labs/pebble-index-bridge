@@ -344,6 +344,24 @@ def _counts_metadata(counts: Any) -> dict[str, Any]:
     return result
 
 
+def _capacity_metadata(capacity: Any) -> dict[str, Any]:
+    if not isinstance(capacity, dict):
+        return {}
+    allowed = {
+        "limits": {"maxPending", "maxRecords", "maxBytes"},
+        "current": {"pending", "records", "bytes"},
+        "remaining": {"pending", "records", "bytes"},
+    }
+    return {
+        group: {
+            key: value
+            for key, value in _counts_metadata(capacity.get(group)).items()
+            if key in keys
+        }
+        for group, keys in allowed.items()
+    }
+
+
 def _build_worker(settings: Settings, store: Store) -> DeliveryWorker:
     return DeliveryWorker(
         store,
@@ -600,7 +618,7 @@ def create_app(
         capacity = await store_op("capacity", current_store.capacity)
         return {
             "counts": _counts_metadata(counts),
-            "capacity": _counts_metadata(capacity),
+            "capacity": _capacity_metadata(capacity),
             "head": None if head is None else _public_metadata(head),
             "recent": [_public_metadata(item) for item in recent],
         }

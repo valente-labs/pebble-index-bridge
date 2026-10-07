@@ -151,7 +151,7 @@ def running_container(ssh: Ssh) -> str | None:
 
 def snapshot(ssh: Ssh, root: str, image: str, now: datetime) -> str:
     """Consistent private DB backup into root/archive/<year> before any recreation."""
-    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    stamp = now.strftime("%Y%m%dT%H%M%S%fZ")
     name = f".pre-deploy-{stamp}.sqlite3"
     source = f"{root}/data/{name}"
     target_dir = f"{root}/archive/{now.year}"
@@ -174,12 +174,14 @@ def snapshot(ssh: Ssh, root: str, image: str, now: datetime) -> str:
         ssh(f"{prefix} python scripts/queue_admin.py backup /data/{q(name)}")
         ssh(f"{prefix} python -c {q(check)} /data/{q(name)}")
         ssh(
-            f"umask 077; mkdir -p {q(target_dir)} && test ! -e {q(target)} "
+            f"umask 077; set -C; mkdir -p {q(target_dir)} && test ! -e {q(target)} "
             f"&& cat {q(source)} > {q(target)} && cmp -s {q(source)} {q(target)} "
             f"&& test -s {q(target)} && rm -f {q(source)}"
         )
     except BaseException:
-        for leftover in (source, target):
+        # An existing archive must survive every failure, including a collision.
+        # A partial newly created archive remains private for operator inspection.
+        for leftover in (source,):
             try:
                 ssh(f"rm -f {q(leftover)}")
             except Exception:

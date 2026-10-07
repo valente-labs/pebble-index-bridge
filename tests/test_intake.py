@@ -62,7 +62,12 @@ class FakeStore:
         return next((item for item in self.events if item["status"] != "delivered"), None)
 
     def capacity(self):
-        return {"maxPending": 1000, "pending": len(self.events), "label": "ignored"}
+        return {
+            "limits": {"maxPending": 1000, "label": "ignored"},
+            "current": {"pending": len(self.events), "transcription": "private"},
+            "remaining": {"pending": 1000 - len(self.events)},
+            "private": "ignored",
+        }
 
 
 class BrokenStore(FakeStore):
@@ -323,7 +328,11 @@ def test_status_always_includes_head_and_capacity_even_beyond_recent_window():
     assert "b" * 64 not in [item["id"] for item in body["recent"]]
     assert body["head"]["id"] == "b" * 64
     assert body["head"]["status"] == "needs_attention"
-    assert body["capacity"] == {"maxPending": 1000, "pending": 26}
+    assert body["capacity"] == {
+        "limits": {"maxPending": 1000},
+        "current": {"pending": 26},
+        "remaining": {"pending": 974},
+    }
 
     with TestClient(make_app(FakeStore())) as client:
         assert client.get("/status", headers=auth_headers()).json()["head"] is None

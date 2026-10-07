@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import time
 from collections.abc import Callable
 from typing import Any
@@ -202,7 +203,10 @@ class DeliverySupervisor:
         self.failures = 0
 
     def _backoff(self) -> float:
-        return min(self.restart_base * (2 ** max(0, self.failures - 1)), self.restart_max)
+        exponent = max(0, self.failures - 1)
+        if exponent >= math.log2(self.restart_max) - math.log2(self.restart_base):
+            return self.restart_max
+        return min(math.ldexp(self.restart_base, exponent), self.restart_max)
 
     async def _start(self, stop_event: asyncio.Event) -> str:
         """Run one worker generation and return the safe code for why it ended."""

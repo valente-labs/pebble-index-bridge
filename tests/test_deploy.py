@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import UTC, datetime
 
 import pytest
 
@@ -22,6 +23,25 @@ MUTATING = (
     "docker run",
     "rm -",
 )
+
+
+def test_snapshot_collision_never_removes_an_existing_archive():
+    commands = []
+
+    def ssh(command, data=None):
+        commands.append(command)
+        if command.startswith("docker ps"):
+            return b"container-id"
+        if "set -C" in command:
+            raise RuntimeError("existing archive")
+        return b""
+
+    with pytest.raises(RuntimeError, match="existing archive"):
+        deploy.snapshot(ssh, ROOT, "image", datetime(2026, 1, 1, tzinfo=UTC))
+    cleanup = [command for command in commands if command.startswith("rm -f")]
+    assert len(cleanup) == 1
+    assert "/data/.pre-deploy-" in cleanup[0]
+    assert "/archive/" not in cleanup[0]
 
 
 def setup(monkeypatch, tmp_path, cfg, action="apply", port="8449"):
