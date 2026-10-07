@@ -78,7 +78,9 @@ class DeliveryWorker:
                 verify=True,
                 follow_redirects=False,
                 trust_env=False,
-                timeout=None,
+                timeout=httpx.Timeout(
+                    None, connect=min(5.0, self.timeout / 3), pool=min(5.0, self.timeout / 3)
+                ),
             )
         return self._client
 

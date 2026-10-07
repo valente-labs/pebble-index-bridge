@@ -141,7 +141,7 @@ def check_subnet(ssh: Ssh, subnet: ipaddress.IPv4Network) -> None:
 def running_container(ssh: Ssh) -> str | None:
     out = ssh(
         f"docker ps -q --filter label=com.docker.compose.project={PROJECT} "
-        "--filter label=com.docker.compose.service=index-bridge"
+        "--filter label=com.docker.compose.service=index-bridge --filter status=running"
     )
     ids = out.decode().split()
     if len(ids) > 1:
@@ -224,7 +224,7 @@ def main() -> None:
     image = f"pebble-index-bridge:{revision[:12]}"
 
     def ssh(command: str, data: bytes | None = None) -> bytes:
-        return run(["ssh", args.ssh_host, command], data)
+        return run(["ssh", "--", args.ssh_host, command], data)
 
     # Read-only preflight: runs for check, plan and apply before any remote mutation.
     ip = config["INDEX_BRIDGE_ADDRESS"]

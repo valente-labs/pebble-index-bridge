@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -116,7 +117,7 @@ class Store:
         # issued by a swarm of concurrent constructors.  Serialize setup in
         # this process; SQLite's busy timeout handles other processes.
         with self._initialise_lock:
-            with self._connect(configure_journal=True) as connection:
+            with closing(self._connect(configure_journal=True)) as connection, connection:
                 connection.executescript(
                     """
                 CREATE TABLE IF NOT EXISTS events (
@@ -236,7 +237,7 @@ class Store:
             raise QueueFull("queue byte capacity reached")
 
         now = self._now()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT event_id, status FROM events WHERE identity = ?", (identity,)
@@ -285,7 +286,7 @@ class Store:
     def get(self, event_id: str) -> dict[str, Any] | None:
         if not isinstance(event_id, str):
             return None
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT * FROM events WHERE event_id = ?", (event_id,)
             ).fetchone()
@@ -296,7 +297,7 @@ class Store:
             bounded_limit = max(1, min(int(limit), 100))
         except (TypeError, ValueError):
             bounded_limit = 20
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 "SELECT * FROM events ORDER BY sequence DESC LIMIT ?", (bounded_limit,)
             ).fetchall()
@@ -310,7 +311,7 @@ class Store:
         arrive behind it.
         """
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT * FROM events WHERE status <> 'delivered' ORDER BY sequence LIMIT 1"
             ).fetchone()
@@ -323,7 +324,7 @@ class Store:
         automatically, and intake answers 503 once any limit is reached.
         """
 
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             records, pending, used_bytes = connection.execute(
                 """
                 SELECT COUNT(*),
@@ -347,7 +348,7 @@ class Store:
         return {"limits": limits, "current": current, "remaining": remaining}
 
     def counts(self) -> dict[str, int]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 "SELECT status, COUNT(*) AS count FROM events GROUP BY status"
             ).fetchall()
@@ -359,7 +360,7 @@ class Store:
 
     def claim_next(self) -> dict[str, Any] | None:
         now = self._now()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             # One owner at a time keeps downstream ordering deterministic and
             # prevents two workers from sending the same queue head.
@@ -411,7 +412,7 @@ class Store:
     ) -> None:
         if to_status not in STATUSES:
             raise ValueError("unknown event status")
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT status FROM events WHERE event_id = ?", (event_id,)
@@ -466,7 +467,7 @@ class Store:
 
     def recover_inflight(self) -> int:
         now = self._now()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 "SELECT event_id FROM events WHERE status = 'sending'"

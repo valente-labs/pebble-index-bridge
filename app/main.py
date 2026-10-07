@@ -214,11 +214,11 @@ class RejectionTracker:
         self.auth_total = 0
         self.rate_total = 0
         self.malformed_total = 0
-        self._last_log = 0.0
+        self._last_log: float | None = None
         self._lock = asyncio.Lock()
 
     def _aggregate_log(self, now: float) -> None:
-        if now - self._last_log < 60:
+        if self._last_log is not None and now - self._last_log < 60:
             return
         self._last_log = now
         log.warning(
@@ -368,7 +368,7 @@ def _build_worker(settings: Settings, store: Store) -> DeliveryWorker:
         settings.grokbot_webhook_url,
         settings.grokbot_webhook_key,
         timeout=settings.request_timeout_seconds,
-        max_attempts=5,
+        max_attempts=12,
         retry_base=2,
         client=None,
     )

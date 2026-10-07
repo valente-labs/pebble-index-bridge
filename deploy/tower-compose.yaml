@@ -17,13 +17,13 @@ services:
       MAX_TRANSCRIPTION_CHARS: ${MAX_TRANSCRIPTION_CHARS:-8000}
       MAX_PENDING: ${MAX_PENDING:-1000}
       MAX_RECORDS: ${MAX_RECORDS:-10000}
-      MAX_BYTES: ${MAX_BYTES:-33554432}
+      MAX_BYTES: ${MAX_BYTES:-67108864}
     secrets:
       - bridge_token
       - grokbot_webhook_url
       - grokbot_webhook_key
     volumes:
-      - ${INDEX_BRIDGE_DATA_DIR:-/data}:/data
+      - ${INDEX_BRIDGE_DATA_DIR:?set INDEX_BRIDGE_DATA_DIR to a dedicated private data directory}:/data
     read_only: true
     security_opt:
       - no-new-privileges:true

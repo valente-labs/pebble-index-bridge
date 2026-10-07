@@ -6,7 +6,7 @@ import ipaddress
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -196,9 +196,9 @@ def _validate_host(host: str, name: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    bridge_token: str
-    grokbot_webhook_url: str
-    grokbot_webhook_key: str
+    bridge_token: str = field(repr=False)
+    grokbot_webhook_url: str = field(repr=False)
+    grokbot_webhook_key: str = field(repr=False)
     request_timeout_seconds: float = 15.0
     max_request_bytes: int = 65536
     max_transcription_chars: int = 8000

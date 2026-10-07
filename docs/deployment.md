@@ -158,7 +158,9 @@ would address a different (empty) project:
 REMOTE_ROOT=/srv/index-bridge
 RELEASE=$(cat "$REMOTE_ROOT/current-release")
 bridge() {
-  docker-compose --project-name pebble-grok --env-file "$RELEASE/.env" \
+  # Set COMPOSE to the invocation reported by deploy.py check (docker compose
+  # or docker-compose).
+  ${COMPOSE:?set COMPOSE from the deployment preflight} --project-name pebble-grok --env-file "$RELEASE/.env" \
     -f "$RELEASE/deploy/tower-compose.yaml" "$@"
 }
 bridge ps
@@ -230,7 +232,8 @@ leaves the old one in place until the new one is checked.
    checkout with Python, or a hardened one-off container mounting only the
    private backup and new data directories. The destination must be new.
    The tool verifies integrity and schema and creates a mode-0600, single-file
-   copy. Use `index-bridge.sqlite3` as the new database name.
+   copy. Set the restored file owner to UID 10001 and group 10001 before
+   starting the service. Use `index-bridge.sqlite3` as the new database name.
 4. Start the service and run `queue_admin.py status`. Compare the counts and
    the head event with what you expect.
 5. Keep the renamed directory until you are satisfied. Removing it is a
@@ -295,6 +298,13 @@ headers. The bridge intentionally rejects audio files and unknown fields so
 the durable contract remains small and auditable.
 
 ## Reconciliation and failure handling
+
+The production worker retries proven pre-send connection failures up to 12
+attempts with exponential backoff, covering roughly an hour of connection
+outage. Separate connect and pool deadlines end before the total request
+deadline. Ambiguous read, write, cancellation and total-deadline failures still
+require reconciliation. Monitor the authenticated `/status` head and its
+`updatedAt` for stuck delivery; `/health` reports process and store availability.
 
 Use the operator tool to inspect counts, the oldest head event, and recent
 metadata. The status API and operator output must not be used as a transcript

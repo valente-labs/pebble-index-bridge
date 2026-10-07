@@ -137,7 +137,7 @@ def main() -> None:
             parser.error("Existing backup file required")
         try:
             with contextlib.closing(
-                sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
+                sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
             ) as source:
                 counts = _copy_to_new_path(source, Path(args.destination))
         except (ValueError, sqlite3.Error) as exc:
@@ -147,7 +147,7 @@ def main() -> None:
     path = Path(args.db)
     if not path.is_file():
         parser.error("Existing database required")
-    connection = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=30)
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=30)
     connection.row_factory = sqlite3.Row
     if args.action == "status":
         counts = dict(connection.execute("SELECT status, COUNT(*) FROM events GROUP BY status"))

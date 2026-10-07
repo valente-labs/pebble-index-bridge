@@ -15,6 +15,20 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_pre_send_connection_timeout_is_shorter_than_total_request_deadline(tmp_path):
+    async def exercise():
+        worker = DeliveryWorker(
+            Store(tmp_path / "queue.sqlite"), "https://example.invalid/hook", "secret", timeout=15
+        )
+        client = await worker._get_client()
+        assert client.timeout.connect == 5
+        assert client.timeout.pool == 5
+        assert client.timeout.read is None
+        await worker.close()
+
+    run(exercise())
+
+
 def test_200_marks_webhook_accepted_and_reuses_client(tmp_path):
     seen = []
 

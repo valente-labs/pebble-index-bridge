@@ -88,3 +88,17 @@ def test_allowed_hosts_reject_wildcards_and_non_host_values(monkeypatch, hosts):
     env(monkeypatch, ALLOWED_HOSTS=hosts)
     with pytest.raises(ConfigError):
         Settings.from_env()
+
+
+def test_settings_repr_never_contains_credentials_or_private_destination():
+    from app.config import Settings
+
+    settings = Settings(
+        bridge_token="private-ring-token",
+        grokbot_webhook_key="private-grok-key",
+        grokbot_webhook_url="https://example.invalid/private-destination",
+    )
+    displayed = repr(settings)
+    assert "private-ring-token" not in displayed
+    assert "private-grok-key" not in displayed
+    assert "private-destination" not in displayed

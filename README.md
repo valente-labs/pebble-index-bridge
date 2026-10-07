@@ -19,7 +19,7 @@ forwards this JSON shape to the configured Grok Bot routine:
   "transcription": "Example spoken text.",
   "recordedAt": 1790037251116,
   "client": "ring",
-  "bridgeRequestId": "<stable-event-id>"
+  "bridgeRequestId": "<stored-public-event-id>"
 }
 ```
 
@@ -71,7 +71,7 @@ database or a backup, when asking for help.
   signal. It means the routine run was accepted or started. It does not mean
   that the routine completed, posted a message, or finished downstream work.
 
-There is no exactly-once external delivery guarantee. A stable local event ID
+There is no exactly-once external delivery guarantee. A private stable duplicate key
 prevents duplicate intake, but the Grok webhook contract does not publish an
 idempotency guarantee or a completion callback.
 

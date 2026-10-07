@@ -157,3 +157,15 @@ def test_restore_refuses_missing_or_foreign_sources_and_missing_parent(tmp_path)
     assert call(db, "restore", str(db), str(tmp_path / "missing" / "new.sqlite")).returncode != 0
     assert not (tmp_path / "new.sqlite").exists()
     assert not list(tmp_path.glob(".queue-copy-*"))
+
+
+def test_backup_and_restore_accept_paths_with_uri_reserved_characters(tmp_path):
+    db = tmp_path / "queue?#.sqlite"
+    store = Store(db)
+    receipt = store.enqueue("synthetic note", "1790037251116", "ring")
+    backup = tmp_path / "backup?#.sqlite"
+    restored = tmp_path / "restored?#.sqlite"
+    assert call(db, "backup", str(backup)).returncode == 0
+    result = call(db, "restore", str(backup), str(restored))
+    assert result.returncode == 0, result.stderr
+    assert Store(restored).get(receipt["id"])["status"] == "queued"

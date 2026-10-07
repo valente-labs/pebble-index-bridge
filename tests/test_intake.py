@@ -231,6 +231,18 @@ def test_rejection_logs_are_aggregated_and_bounded(caplog):
     assert store.events == []
 
 
+def test_first_rejection_log_does_not_depend_on_machine_uptime(caplog):
+    from app.main import RejectionTracker
+
+    tracker = RejectionTracker(10, 60)
+    with caplog.at_level(logging.WARNING, logger="index-bridge"):
+        for now in (1.0, 2.0, 3.0, 61.0, 62.0):
+            tracker.auth_total += 1
+            tracker._aggregate_log(now)
+    records = [r for r in caplog.records if r.message.startswith("security_rejections")]
+    assert len(records) == 2
+
+
 def test_health_reports_database_failure_and_dead_worker():
     with TestClient(make_app(BrokenStore())) as client:
         assert client.get("/health").status_code == 503
