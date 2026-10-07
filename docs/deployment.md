@@ -131,14 +131,18 @@ python3 scripts/deploy.py plan  --ssh-host HOST --remote-root /srv/index-bridge 
 python3 scripts/deploy.py apply --ssh-host HOST --remote-root /srv/index-bridge --config deployment.json
 ```
 
-`check` validates the remote prerequisites (`docker`, `docker-compose`) and
-the configuration, `plan` prints the revision and image that would be
+`check` validates Docker, Compose v2 or newer (plugin or standalone), secret
+file permissions and UID 10001 ownership, subnet and route availability, and
+the configuration. `plan` prints the revision and image that would be
 deployed, and `apply` builds the image on the host, starts it, waits for
 `/health`, and keeps `REMOTE_ROOT/data` in place. The tree must be committed
 because the helper deploys `git archive` of `HEAD`. The private JSON config
 contains exactly `ALLOWED_HOSTS`, `INDEX_BRIDGE_SUBNET`, and
 `INDEX_BRIDGE_ADDRESS`. Provision the three mode-0600 secret files under
-`REMOTE_ROOT/secrets` through your encrypted secret manager before applying.
+`REMOTE_ROOT/secrets` through your encrypted secret manager before applying,
+owned by UID 10001. Before replacing an existing container, the helper takes
+a consistent private snapshot into `REMOTE_ROOT/archive/<year>/`. This protects
+against deployment mistakes; keep a separate private backup for host failure.
 Choose an unused private subnet and a usable static address.
 
 To use Tailscale Serve, add `--serve-port PORT` (1024 to 65535) to all three
@@ -167,7 +171,8 @@ substitute `docker compose --env-file .env exec index-bridge ...`.
 ### Operator actions
 
 `queue_admin.py` runs inside the container, has no network interface, and
-takes `status`, `backup DESTINATION`, or `resolve EVENT_ID --outcome ...`.
+takes `status`, `backup DESTINATION`, `restore BACKUP DESTINATION`, or
+`resolve EVENT_ID --outcome ...`.
 
 For a head event that needs review:
 
@@ -220,8 +225,12 @@ leaves the old one in place until the new one is checked.
 2. Rename, do not delete, the current data directory, for example
    `mv data data.before-restore-YYYYMMDD`. This keeps the old database and its
    `-wal` and `-shm` companions together.
-3. Create a new `data` directory (mode 0700, owner UID 10001), then copy the
-   backup into it as a new file named `index-bridge.sqlite3` with mode 0600.
+3. Create a new `data` directory (mode 0700, owner UID 10001). Use
+   `python scripts/queue_admin.py restore BACKUP NEW_DATABASE` from a local
+   checkout with Python, or a hardened one-off container mounting only the
+   private backup and new data directories. The destination must be new.
+   The tool verifies integrity and schema and creates a mode-0600, single-file
+   copy. Use `index-bridge.sqlite3` as the new database name.
 4. Start the service and run `queue_admin.py status`. Compare the counts and
    the head event with what you expect.
 5. Keep the renamed directory until you are satisfied. Removing it is a

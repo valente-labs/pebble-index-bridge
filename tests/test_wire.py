@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -187,6 +188,7 @@ def server(tmp_path: Path) -> Iterator[Server]:
         try:
             assert process.stdout is not None
             deadline = time.monotonic() + STARTUP_DEADLINE
+            assert select.select([process.stdout], [], [], STARTUP_DEADLINE)[0], "startup timed out"
             port_line = process.stdout.readline()
             assert port_line.strip().isdigit(), log_path.read_text()
             running = Server(process, int(port_line), log_path)
