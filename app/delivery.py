@@ -1,0 +1,132 @@
+"""Safe FIFO delivery of durable Pebble events to a downstream webhook."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any
+
+import httpx
+
+from .store import Store
+
+log = logging.getLogger("index-bridge")
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())
+log.setLevel(logging.INFO)
+log.propagate = False
+
+
+class DeliveryWorker:
+    """Deliver one queue head at a time with conservative failure handling."""
+
+    def __init__(
+        self,
+        store: Store,
+        url: str,
+        key: str,
+        timeout: float = 15,
+        max_attempts: int = 5,
+        retry_base: float = 2,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if not isinstance(url, str) or not url:
+            raise ValueError("delivery URL is required")
+        if not isinstance(key, str) or not key:
+            raise ValueError("delivery key is required")
+        if timeout <= 0 or max_attempts < 1 or retry_base <= 0:
+            raise ValueError("invalid delivery limits")
+        self.store = store
+        self.url = url
+        self.key = key
+        self.timeout = float(timeout)
+        self.max_attempts = int(max_attempts)
+        self.retry_base = float(retry_base)
+        self._client = client
+        self._owns_client = client is None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                verify=True,
+                follow_redirects=False,
+                trust_env=False,
+                timeout=None,
+            )
+        return self._client
+
+    def _retry_at(self, attempts: int) -> int:
+        # Keep a bad network path from producing an unbounded timestamp.
+        delay = min(self.retry_base * (2 ** max(0, attempts - 1)), 3600.0)
+        return int(time.time() + delay)
+
+    async def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def _send(self, payload: dict[str, Any]) -> int:
+        client = await self._get_client()
+        headers = {
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        }
+        # ``stream`` lets HTTPX close and discard the response stream without
+        # buffering an untrusted downstream body in memory.
+        async with asyncio.timeout(self.timeout):
+            async with client.stream("POST", self.url, headers=headers, json=payload) as response:
+                return int(response.status_code)
+
+    async def run_once(self) -> bool:
+        event = self.store.claim_next()
+        if event is None:
+            return False
+        event_id = event["id"]
+        attempts = int(event["attempts"])
+        try:
+            status = await self._send(event["payload"])
+        except asyncio.CancelledError:
+            self.store.mark_attention(event_id, "cancelled")
+            raise
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if attempts < self.max_attempts:
+                self.store.mark_retry(event_id, "connect_error", self._retry_at(attempts))
+            else:
+                self.store.mark_attention(event_id, "connect_error_exhausted")
+            return True
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            # A timeout can occur after the server accepted the body. Never
+            # resend automatically when acceptance is ambiguous.
+            self.store.mark_attention(event_id, "ambiguous_timeout")
+            return True
+        except httpx.RequestError:
+            # Read/write/protocol failures do not prove that no request was
+            # accepted, so they require operator review.
+            self.store.mark_attention(event_id, "ambiguous_transport_error")
+            return True
+        except Exception:
+            # A process/runtime error after claim is also ambiguous. Do not
+            # let an application exception turn into a blind duplicate send.
+            self.store.mark_attention(event_id, "delivery_error")
+            log.error("delivery event_id=%s error=delivery_error", event_id)
+            return True
+
+        log.info("delivery event_id=%s http_status=%d", event_id, status)
+        if status == 200:
+            self.store.mark_delivered(event_id, http_status=status)
+        else:
+            self.store.mark_attention(event_id, f"http_{status}", http_status=status)
+        return True
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        try:
+            while not stop_event.is_set():
+                processed = await self.run_once()
+                if not processed:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            await self.close()

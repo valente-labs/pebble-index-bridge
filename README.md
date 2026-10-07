@@ -1,500 +1,126 @@
-# Pebble Index 01 → Grok Bot Bridge
+# Pebble transcription to Grok Bot bridge
 
-A small self-hosted bridge that lets a Pebble Index 01 send voice transcriptions to a Grok Bot agent/routine.
-
-## Why I made this
-
-I wanted to use my Index 01 as a quick voice input for my Grok Bot setup. I have a main agent that acts as the entry point to a group of specialist agents, so the idea was simple: speak into the ring, have the transcription land with the main agent, and let it deal with the request from there.
-
-The two webhook implementations didn't quite agree.
-
-Pebble sends Index transcriptions as `multipart/form-data`. The Grok Bot routine webhook I was sending them to expected JSON. Pointing the Index directly at Grok Bot resulted in `415 Unsupported Media Type`.
-
-This bridge fixes that mismatch:
+Valente Labs maintains this small self-hosted translator for one narrow path:
 
 ```text
-Pebble Index 01
-      |
-      | multipart/form-data
-      v
- Index Bridge
-      |
-      | application/json
-      v
-Grok Bot routine
-      |
-      v
-  Your agent
+Pebble webhook (multipart/form-data)
+        -> authenticated bridge
+        -> durable SQLite queue
+        -> Grok Bot routine webhook (application/json)
 ```
 
-It also keeps the Grok Bot webhook credential on the server. The Index only gets a separate token for the bridge.
-
-This is intentionally small. I built it for Index 01 → Grok Bot, but there isn't much stopping someone from adapting the forwarding code for another webhook or agent platform.
-
-## Tested setup
-
-The original setup was tested end-to-end with:
-
-**Pebble Index 01 → Index Bridge in Docker on an Ubuntu server → Tailscale Funnel → Grok Bot routine → Grok Bot agent**
-
-A real recording from the Index was transcribed, sent through the hardened bridge, and received by the agent. The hardened release was also tested for invalid authentication (`401`), oversized payload rejection (`413`), public Funnel reachability, container hardening checks, and delivery of a HIGH security alert through a separate Grok Bot routine.
-
-## What you'll need
-
-- Pebble Index 01 and the Pebble app
-- A Grok Bot agent
-- A Linux machine/server that can run Docker
-- Docker Engine and Docker Compose
-- A way to give the bridge a public HTTPS endpoint
-
-These instructions use Tailscale Funnel for the public HTTPS endpoint because that's what I use. Another tunnel or reverse proxy can be substituted.
-
-Unless a step says otherwise, the terminal commands below are run **on the server that will host Index Bridge**.
-
-## 1. Create the Grok Bot routine
-
-In Grok Bot, create a routine on the agent you want the Index to talk to and give it a webhook trigger.
-
-You can also just ask the agent to set this up for you. For example:
-
-> Create a routine called "Pebble Index Intake" with a webhook trigger. It will receive JSON from my Pebble Index 01 containing a `transcription` field. Treat the value of `transcription` as a message spoken directly to you by me and act on it normally. Don't discuss the transport metadata unless it's relevant to troubleshooting.
-
-Once the routine exists, you'll need its:
-
-- POST URL
-- webhook key (`crsr_...`)
-
-Depending on your Grok Bot version, you can ask the agent to show you the webhook details or open the routine and view its webhook configuration.
-
-Keep both values private. The Grok Bot key stays on the server and is **not** entered into the Pebble app.
-
-When configuring the bridge later, enter only the `crsr_...` value for `GROKBOT_WEBHOOK_KEY`. The bridge adds `Authorization: Bearer` when it calls Grok Bot.
-
-## 2. Check Docker
-
-Make sure Docker and Docker Compose are available:
-
-```bash
-# Show the installed Docker version
-docker --version
-
-# Show the installed Docker Compose version
-docker compose version
-```
-
-If either command is missing, install Docker Engine and the Docker Compose plugin for your Linux distribution before continuing.
-
-## 3. Install Index Bridge
-
-```bash
-# Download the bridge from GitHub
-git clone https://github.com/Zhigre/pebble-index-bridge.git
-
-# Move into the downloaded project folder
-cd pebble-index-bridge
-
-# Create your private configuration file from the supplied example
-cp .env.example .env
-
-# Restrict the configuration file because it will contain credentials
-chmod 600 .env
-```
-
-Generate a separate token for the Index to use:
-
-```bash
-# Generate a long random token for authenticating requests from the Index
-python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-```
-
-Copy the generated value somewhere temporarily. You'll put it into `.env` and later into the Pebble webhook configuration.
-
-Open the configuration:
-
-```bash
-# Open the private configuration file in the nano text editor
-nano .env
-```
-
-Set the values:
-
-```env
-BRIDGE_TOKEN=your-generated-token
-GROKBOT_WEBHOOK_URL=https://your-grokbot-routine-webhook
-GROKBOT_WEBHOOK_KEY=crsr_your_key
-REQUEST_TIMEOUT_SECONDS=15
-MAX_REQUEST_BYTES=65536
-MAX_TRANSCRIPTION_CHARS=8000
-RATE_LIMIT_REQUESTS=10
-RATE_LIMIT_WINDOW_SECONDS=60
-AUTH_FAILURE_ALERT_THRESHOLD=10
-LOG_TRANSCRIPTIONS=false
-LOG_LEVEL=INFO
-
-# Optional separate Grok Bot routine for security notifications
-SECURITY_ALERT_WEBHOOK_URL=
-SECURITY_ALERT_WEBHOOK_KEY=
-```
-
-In nano, press `Ctrl+O`, then `Enter` to save, and `Ctrl+X` to exit.
-
-For `GROKBOT_WEBHOOK_KEY`, paste only the `crsr_...` value. Do not add `Bearer`.
-
-## 4. Start the bridge
-
-```bash
-# Build the Docker image and start the bridge in the background
-docker compose up -d --build
-
-# Check that the bridge container is running
-docker compose ps
-
-# Confirm the container is running and healthy
-docker compose ps
-```
-
-The supplied image has an internal Docker health check. A healthy deployment should show the container as `healthy`. There is deliberately no public `/health` HTTP route; the only intended application route is `POST /index`.
-
-## 5. Test Index Bridge → Grok Bot
-
-Before involving the ring or the public internet, send a simulated Index request locally:
-
-```bash
-# Read your bridge token from .env into this shell session
-BRIDGE_TOKEN=$(grep '^BRIDGE_TOKEN=' .env | cut -d= -f2-)
-
-# Send form-data to the bridge in the same format used by the Index
-curl -i -X POST http://localhost:8000/index \
-  -H "Authorization: Bearer $BRIDGE_TOKEN" \
-  -F 'transcription=This is a test message through Index Bridge.' \
-  -F 'recordedAt=1790037251116' \
-  -F 'client=ring'
-```
-
-A successful request should return HTTP `200` with a response similar to:
-
-```json
-{
-  "ok": true,
-  "requestId": "...",
-  "grokbotStatus": 200
-}
-```
-
-The test transcription should also arrive at your Grok Bot agent.
-
-At this point you've proven:
-
-```text
-Index-shaped request → Index Bridge → Grok Bot → agent
-```
-
-## 6. Install and connect Tailscale
-
-If Tailscale is not already installed on the server, install it using the instructions for your operating system, then authenticate the server to your tailnet.
-
-Once installed:
-
-```bash
-# Check that Tailscale is installed
-tailscale version
-
-# Connect/authenticate this server to your Tailscale network
-sudo tailscale up
-```
-
-If authentication is required, Tailscale will provide a URL. Open it in a browser and approve the server.
-
-Confirm that the server is connected:
-
-```bash
-# Show this server and the other devices in your tailnet
-tailscale status
-```
-
-## 7. Enable Tailscale Funnel
-
-Funnel makes the bridge reachable from the public internet over HTTPS without opening a router port.
-
-Start Funnel:
-
-```bash
-# Publish local port 8000 through a public HTTPS Tailscale Funnel
-sudo tailscale funnel --bg 8000
-```
-
-On first use, Tailscale may give you a URL asking you to enable Funnel/HTTPS for the tailnet. Open that URL, enable the required setting, then run the command again if necessary.
-
-Check the result:
-
-```bash
-# Show the public Funnel URL and where it forwards traffic
-tailscale funnel status
-```
-
-You should get a public address similar to:
-
-```text
-https://your-server.your-tailnet.ts.net
-```
-
-The bridge's public Index endpoint will therefore be:
-
-```text
-https://your-server.your-tailnet.ts.net/index
-```
-
-The supplied Compose file binds port 8000 to `127.0.0.1` only. This keeps the application from listening directly on every network interface while allowing a tunnel/reverse proxy on the same server to reach it.
-
-## 8. Test the public endpoint
-
-Do this **before** configuring Pebble. It separates server/Funnel problems from Pebble configuration problems.
-
-From another computer, send an Index-shaped request with a deliberately wrong token:
-
-```bash
-# Replace the hostname below with the public hostname shown by
-# `tailscale funnel status`
-curl -i -X POST https://your-server.your-tailnet.ts.net/index \
-  -H "Authorization: Bearer deliberately-wrong" \
-  -F 'transcription=public connectivity test'
-```
-
-You should receive HTTP `401 Unauthorized`. That is intentional: it proves the public Funnel reached the hardened bridge and that authentication rejected the request.
-
-There is deliberately no public `/health` route. Unknown paths return `404`.
-
-You have now proven:
-
-```text
-Internet → Tailscale Funnel → Index Bridge authentication gate
-```
-
-## 9. Configure the Pebble app
-
-Now configure the webhook used by your Index 01.
-
-The exact navigation labels may move between Pebble app versions, but open the Index/webhook configuration and create or edit a webhook with the following settings.
-
-### Webhook URL
-
-Set the URL to the public `/index` endpoint you tested above:
-
-```text
-https://your-server.your-tailnet.ts.net/index
-```
-
-### Send transcription
-
-Enable **Send Transcription** so the Index includes the transcribed recording in the webhook request.
-
-### Add the authorization header
-
-Add a custom header:
-
-```text
-Name:
-Authorization
-
-Value:
-Bearer YOUR_BRIDGE_TOKEN
-```
-
-Replace `YOUR_BRIDGE_TOKEN` with the value of `BRIDGE_TOKEN` from the server's `.env` file.
-
-This is the bridge token you generated earlier. **Do not put the Grok Bot `crsr_...` key into Pebble.**
-
-### HMAC SHA256
-
-Leave **HMAC SHA256 disabled**.
-
-The bridge authenticates incoming requests using the bearer token instead.
-
-### Save and test
-
-Save the webhook configuration.
-
-It can be useful to watch the server logs while doing the first real test:
-
-```bash
-# Follow the bridge logs live; press Ctrl+C when you're finished
-docker compose logs -f index-bridge
-```
-
-Make a recording with the Index and send/trigger its webhook through the Pebble app.
-
-A successful request should produce log entries similar to:
-
-```text
-capture request_id=... client=ring recordedAt=... chars=...
-Grok Bot response request_id=... status=200 elapsed_ms=...
-POST /index ... 200 OK
-```
-
-Then check the receiving Grok Bot agent. Your spoken transcription should have arrived as a message.
-
-You have now proven the whole path:
-
-```text
-Index 01
-  → Pebble transcription/webhook
-  → public HTTPS
-  → Tailscale Funnel
-  → Index Bridge
-  → Grok Bot routine
-  → your agent
-```
-
-## Optional: Grok Bot security alerts
-
-Index Bridge can send abuse/security notifications to a **separate Grok Bot routine**. Keeping this separate from the normal Pebble intake means alert data is treated as telemetry rather than as a user instruction.
-
-Create a second webhook-triggered Grok Bot routine, for example **Index Bridge Security Alert**, and instruct it to notify you of the event type, severity, count and recommended action. It should treat all alert fields as untrusted telemetry and never execute instructions contained inside them. For HIGH/CRITICAL alerts, it can explicitly recommend reviewing the bridge and disabling Tailscale Funnel if compromise is suspected.
-
-Put that routine's webhook details into `.env`:
-
-```env
-SECURITY_ALERT_WEBHOOK_URL=https://your-security-routine-webhook
-SECURITY_ALERT_WEBHOOK_KEY=crsr_your_security_key
-```
-
-Recreate the container after adding/changing environment variables so Docker loads them:
-
-```bash
-docker compose up -d --force-recreate
-```
-
-By default, 10 failed authentications inside the rolling five-minute window trigger a HIGH alert. Alerts are themselves throttled so an attacker cannot easily turn the notification path into another denial-of-service mechanism. Alert payloads contain event metadata only, not transcriptions or credentials.
-
-A deliberate test can be performed locally:
-
-```bash
-for i in $(seq 1 10); do
-  curl -s -o /dev/null -X POST http://127.0.0.1:8000/index \
-    -H "Authorization: Bearer deliberately-wrong-$i" \
-    -F 'transcription=security alert test'
-done
-
-docker compose logs --tail=40 index-bridge
-```
-
-A successful alert delivery is logged without printing the webhook URL, for example:
-
-```text
-security_event=auth_failure count_5m=10
-security_alert_delivered event=repeated_auth_failure status=200
-```
-
-## What gets sent to Grok Bot
-
-The bridge converts Pebble's form fields into JSON:
+Pebble sends a transcription-only multipart request. The bridge validates the
+three supported fields, stores the event before acknowledging Pebble, and
+forwards this JSON shape to the configured Grok Bot routine:
 
 ```json
 {
   "source": "pebble-index-01",
-  "transcription": "Example message spoken into the ring.",
-  "recordedAt": "1790037251116",
+  "transcription": "Example spoken text.",
+  "recordedAt": 1790037251116,
   "client": "ring",
-  "bridgeRequestId": "..."
+  "bridgeRequestId": "<stable-event-id>"
 }
 ```
 
-## Troubleshooting
+The bridge uses one bearer token for Pebble and keeps the separate Grok
+webhook key on the server. It does not store or expose conversation text from
+status endpoints. Transcription logging is disabled by default.
 
-### Is the container running?
+## Supported contract
 
-```bash
-# Show the current state of the bridge container
-docker compose ps
-```
+- `POST /index` only.
+- `multipart/form-data` with exactly `transcription`, `recordedAt`, and
+  `client` fields. `client` defaults to `ring` when omitted by a compatible
+  sender.
+- `Authorization: Bearer <bridge token>` is required on every intake request.
+- The queue is durable SQLite at `DB_PATH`, with a persistent volume required
+  for container deployments.
+- Event identity is stable for normalized transcription, `recordedAt`, and
+  `client`. Re-sending the same source event returns the existing receipt.
+- Delivery is FIFO. A `needs_attention` event stops later events until an
+  operator reconciles it.
+- A connection failure before a request is sent may receive bounded retry.
+  Timeouts, cancellations, process restarts, and other ambiguous outcomes do
+  not auto-resend because the downstream may already have accepted the body.
+- For the Grok Bot routine integration, only HTTP `200` is an acceptance
+  signal. It means the routine run was accepted or started. It does not mean
+  that the routine completed, posted a message, or finished downstream work.
 
-### Is the bridge healthy locally?
+There is no exactly-once external delivery guarantee. A stable local event ID
+prevents duplicate intake, but the Grok webhook contract does not publish an
+idempotency guarantee or a completion callback.
 
-```bash
-# The Dockerfile contains an internal TCP health check
-docker compose ps
-```
+## Quick start
 
-Look for `healthy` in the container status.
+1. Create or edit a webhook-triggered routine on the owning Grok Bot from the
+   desktop routine UI. Copy its live `POST to`, key, and header values. The
+   routine instruction should tell the Bot to treat the JSON `transcription`
+   value as the spoken request and post it visibly in the owning Bot
+   conversation before doing any specialist delegation it is configured to do.
+2. Copy `.env.example` to `.env`. Put `BRIDGE_TOKEN` and
+   `GROKBOT_WEBHOOK_KEY` in files referenced by `BRIDGE_TOKEN_FILE` and
+   `GROKBOT_WEBHOOK_KEY_FILE`; do not place secret values in Git or shell
+   history. Store the URL in `GROKBOT_WEBHOOK_URL_FILE` as well.
+3. Give the service a persistent private directory mounted at `/data` and set
+   `DB_PATH=/data/index-bridge.sqlite3`.
+4. Run the deployment checks and review the generated plan:
 
-### Does the public Funnel reach the bridge?
+   ```bash
+   docker compose --env-file .env config --quiet
+   docker compose --env-file .env up -d --build --wait
+   ```
 
-```bash
-# Replace this with your own Funnel hostname. A 401 response is expected.
-curl -i -X POST https://your-server.your-tailnet.ts.net/index \
-  -H "Authorization: Bearer deliberately-wrong" \
-  -F 'transcription=public connectivity test'
-```
+   For remote SSH deployment, use `scripts/deploy.py apply` with host, root and configuration arguments. Read `python3 scripts/deploy.py --help`
+   for the current options.
+5. Configure Pebble's webhook to the bridge's HTTPS `/index` URL, add the
+   `Authorization` custom header with the bridge token, and select
+   **transcription only**. Send a synthetic event first, then a short test
+   recording.
+6. Use `python3 scripts/queue_admin.py --help` for queue inspection and reconciliation.
+   Resolve the head event before retrying later events.
 
-### What happened to the last request?
+The complete generic deployment and private-network guidance is in
+[`docs/deployment.md`](docs/deployment.md). The control and audit matrix is in
+[`docs/security.md`](docs/security.md).
 
-```bash
-# Show the latest 100 log entries from the bridge
-docker compose logs --tail=100 index-bridge
-```
+## Grok Bot boundary
 
-A few useful clues:
+The bridge owns intake, durable local state, and the outbound HTTP request. It
+does not own Grok Bot conversation history, routine memory, approvals, cloud
+computer access, or Bot-to-Bot specialist delegation. A webhook trigger starts
+a routine run according to Grok's current Bot configuration. It is not a
+continuation token for the HTTP request, and the bridge cannot infer when a
+routine or specialist has finished.
 
-- `401` on `/index`: the Pebble/bridge token doesn't match.
-- `400 Missing transcription`: Pebble didn't send a usable transcription field.
-- `502`: the bridge received the Index request, but the Grok Bot webhook failed or rejected it.
-- `415` when going directly from Pebble to Grok Bot: that's the content-type mismatch this bridge was built to solve.
+Grok's cloud computer and a user's local computer are separate execution
+boundaries. Tailscale can provide an optional private network path to the
+bridge, but it does not change where Grok runs and does not replace bearer
+authentication.
 
-Transcription text is not written to the bridge logs by default. Set `LOG_TRANSCRIPTIONS=true` temporarily if you need the actual text while debugging. HTTP client request logging is also suppressed so configured webhook URLs are not printed during normal operation.
+## Network choices
 
+The bridge listens locally. Put a generic HTTPS reverse proxy, managed HTTPS
+endpoint, or equivalent translator in front of it. Tailscale Serve is an
+optional private alternative when the Pebble delivery path can reach the
+tailnet endpoint. Configure the Serve route explicitly with the deployment helper or your own ingress and test
+it from the actual Pebble path. Tailscale Funnel is public exposure and is
+never enabled automatically by this project. Even on a private tailnet, keep
+the bridge bearer token and HTTPS validation enabled.
 
-## Security and risk
+## Attribution
 
-This bridge deliberately exposes an HTTP endpoint to the public internet when used with Tailscale Funnel. The bearer token protects `/index`, but it is still a public service and should be treated as one: automated scanners will find it, and a leaked `BRIDGE_TOKEN` would allow someone to submit messages to your Grok Bot agent as though they came through the bridge. Depending on what your agent is allowed to do, that could be more serious than receiving an annoying fake transcription. Use a long random bridge token, keep both tokens out of Git and screenshots, rotate them if they leak, and give the receiving agent only the permissions it actually needs.
+This maintained fork is by Valente Labs and preserves attribution to the
+original [`Zhigre/pebble-index-bridge`](https://github.com/Zhigre/pebble-index-bridge)
+project and its upstream MIT notice.
+The fork adds durable intake, stable deduplication, FIFO delivery, operator
+reconciliation, and deployment hardening. See [`LICENSE`](LICENSE) for the
+license text present in this checkout.
 
-The default configuration reduces the exposed surface: Docker binds the app only to `127.0.0.1`, the container runs as a non-root user with Linux capabilities dropped and a read-only filesystem, FastAPI's interactive API documentation is disabled, incoming `/index` requests are size-limited, the Grok Bot destination must use HTTPS, transcription text is not logged by default, and `.env` is excluded from both Git and the Docker build context. These controls reduce risk; they do not make a public webhook inherently trusted or immune to denial-of-service attacks. Keep the host, Docker, Tailscale and Python dependencies patched, and review the permissions/actions available to the receiving Grok Bot agent before exposing it.
+## References
 
-Tailscale Funnel is public: anyone who knows or discovers the Funnel URL can connect to it. If you stop using the bridge, disable the Funnel rather than leaving an unused public endpoint running:
-
-```bash
-# Remove the Funnel configuration when you no longer need the public endpoint
-sudo tailscale funnel reset
-```
-
-## A note about internet scanners
-
-Tailscale Funnel creates a **public** HTTPS endpoint. Public endpoints get probed by automated scanners, often very quickly.
-
-You may see requests in the logs for unrelated paths such as WordPress, `.env`, `/graphql`, `/actuator`, and other common targets. Unknown routes returning `404` is normal.
-
-The important protections in the default setup are:
-
-- `/index` requires your `BRIDGE_TOKEN`.
-- The Grok Bot credential stays on the server.
-- Docker publishes port 8000 only on `127.0.0.1` by default.
-- Transcription text is not logged by default.
-
-Use a long random `BRIDGE_TOKEN` and don't commit your `.env` file to Git.
-
-## License
-
-The Unlicense. Use it, change it, pull it apart, or adapt it to something else.
-
-## Security model and residual risk
-
-When Tailscale Funnel is enabled, Index Bridge is intentionally reachable from the public internet. This project therefore assumes hostile traffic will reach the service and uses layered controls rather than relying on obscurity.
-
-The default configuration includes: a localhost-only Docker port; bearer-token authentication with constant-time comparison; POST-only `/index`; no FastAPI docs/OpenAPI; multipart-only requests; strict form-field and transcription validation; 64 KiB request limit; authenticated rate limiting; security-event logging without transcription contents; optional separate Grok Bot security alerts; HTTPS-only Grok Bot destinations; a non-root container; read-only root filesystem; all Linux capabilities dropped; `no-new-privileges`; PID, memory and CPU limits; no host mounts or Docker socket; pinned Python dependencies; `.env` excluded from Git and the Docker build context; Dependabot; and CI secret/vulnerability scanning.
-
-Optional Grok Bot security alerts are deliberately rate-limited. Configure a separate Grok Bot routine/webhook using `SECURITY_ALERT_WEBHOOK_URL` and `SECURITY_ALERT_WEBHOOK_KEY`. Alerts contain event metadata only, never the bridge token, Grok Bot key, or transcription. Suggested routine behaviour: notify the user that suspicious Index Bridge activity was detected, recommend reviewing bridge logs, and recommend disabling Tailscale Funnel if the activity appears hostile.
-
-Run `./security-check.sh` from the project directory after deployment. It verifies several important container/deployment assumptions. A passing result is a configuration check, not proof that the service is invulnerable.
-
-### Use at your own risk
-
-This is a small self-hosted project, not a professionally audited security product. The controls above reduce common risks but do not eliminate them. Vulnerabilities may exist in Index Bridge, Python dependencies, Docker, Tailscale, the host OS, or the downstream AI service. A stolen bridge token can be used to submit messages to the configured Grok Bot agent, and the consequences depend on what tools/actions that agent is allowed to perform. Keep the host and dependencies patched, use unique high-entropy credentials, give the receiving agent only the authority it needs, monitor security events, and rotate credentials after suspected exposure.
-
-One important residual risk is **network egress after a full container compromise**. The application itself only sends HTTPS to its configured Grok Bot/security webhooks, but Docker networking does not by itself provide a portable hostname-aware outbound allowlist. For stronger containment, deploy the bridge in a DMZ/VLAN or add host/firewall egress rules that deny access to LAN, management, Tailscale and other private networks while permitting only required DNS/HTTPS destinations. This is intentionally not installed automatically because incorrect firewall rules can break or weaken an existing host network configuration.
-
-Application-level alerts also cannot reliably detect or report every full container compromise. High-assurance deployments should monitor the container externally from the host or a separate security system.
-
-Emergency shutdown of all Tailscale Funnel exposure:
-
-```bash
-sudo tailscale funnel reset
-```
+- [Grok Bot routines](https://prod.cursor.com/help/grok-bot/routines)
+- [xAI routines and automations](https://docs.x.ai/grok-bot/skills-routines-and-automations)
+- [Pebble Index webhooks](https://help.repebble.com/en/articles/15724406-index-advanced-features-mcp-webhook)
+- [Tailscale Serve](https://tailscale.com/docs/use-cases/application-testing/share-local-dev-server-with-team)
+- [Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel)
