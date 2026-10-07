@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -16,6 +18,28 @@ if not log.handlers:
     log.addHandler(logging.StreamHandler())
 log.setLevel(logging.INFO)
 log.propagate = False
+
+
+def quiet_http_loggers() -> None:
+    """Keep HTTPX/HTTPCore from logging request URLs, even with a root INFO level."""
+
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+quiet_http_loggers()
+
+
+async def store_call(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking store method off the event loop.
+
+    Test doubles may expose coroutine methods; their coroutine is awaited here.
+    """
+
+    result = await asyncio.to_thread(function, *args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 class DeliveryWorker:
@@ -45,6 +69,7 @@ class DeliveryWorker:
         self.retry_base = float(retry_base)
         self._client = client
         self._owns_client = client is None
+        quiet_http_loggers()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -78,8 +103,22 @@ class DeliveryWorker:
             async with client.stream("POST", self.url, headers=headers, json=payload) as response:
                 return int(response.status_code)
 
+    async def _claim(self) -> dict[str, Any] | None:
+        claim = asyncio.ensure_future(store_call(self.store.claim_next))
+        try:
+            return await asyncio.shield(claim)
+        except asyncio.CancelledError:
+            # The thread cannot be interrupted; settle whatever it claimed.
+            try:
+                event = await claim
+            except Exception:
+                event = None
+            if event is not None:
+                await store_call(self.store.mark_attention, event["id"], "cancelled")
+            raise
+
     async def run_once(self) -> bool:
-        event = self.store.claim_next()
+        event = await self._claim()
         if event is None:
             return False
         event_id = event["id"]
@@ -87,36 +126,40 @@ class DeliveryWorker:
         try:
             status = await self._send(event["payload"])
         except asyncio.CancelledError:
-            self.store.mark_attention(event_id, "cancelled")
+            await store_call(self.store.mark_attention, event_id, "cancelled")
             raise
         except (httpx.ConnectError, httpx.ConnectTimeout):
             if attempts < self.max_attempts:
-                self.store.mark_retry(event_id, "connect_error", self._retry_at(attempts))
+                await store_call(
+                    self.store.mark_retry, event_id, "connect_error", self._retry_at(attempts)
+                )
             else:
-                self.store.mark_attention(event_id, "connect_error_exhausted")
+                await store_call(self.store.mark_attention, event_id, "connect_error_exhausted")
             return True
         except (asyncio.TimeoutError, httpx.TimeoutException):
             # A timeout can occur after the server accepted the body. Never
             # resend automatically when acceptance is ambiguous.
-            self.store.mark_attention(event_id, "ambiguous_timeout")
+            await store_call(self.store.mark_attention, event_id, "ambiguous_timeout")
             return True
         except httpx.RequestError:
             # Read/write/protocol failures do not prove that no request was
             # accepted, so they require operator review.
-            self.store.mark_attention(event_id, "ambiguous_transport_error")
+            await store_call(self.store.mark_attention, event_id, "ambiguous_transport_error")
             return True
         except Exception:
             # A process/runtime error after claim is also ambiguous. Do not
             # let an application exception turn into a blind duplicate send.
-            self.store.mark_attention(event_id, "delivery_error")
+            await store_call(self.store.mark_attention, event_id, "delivery_error")
             log.error("delivery event_id=%s error=delivery_error", event_id)
             return True
 
         log.info("delivery event_id=%s http_status=%d", event_id, status)
         if status == 200:
-            self.store.mark_delivered(event_id, http_status=status)
+            await store_call(self.store.mark_delivered, event_id, http_status=status)
         else:
-            self.store.mark_attention(event_id, f"http_{status}", http_status=status)
+            await store_call(
+                self.store.mark_attention, event_id, f"http_{status}", http_status=status
+            )
         return True
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -130,3 +173,78 @@ class DeliveryWorker:
                         pass
         finally:
             await self.close()
+
+
+class DeliverySupervisor:
+    """Restart a failed delivery worker with bounded backoff.
+
+    Stale ``sending`` rows are settled as ``needs_attention`` before every
+    (re)start, so a send whose outcome is unknown is never retried blindly.
+    Only fixed error codes are logged, never exception text.
+    """
+
+    def __init__(
+        self,
+        worker: Any,
+        store: Any,
+        restart_base: float = 1.0,
+        restart_max: float = 30.0,
+        stable_seconds: float = 60.0,
+    ) -> None:
+        if restart_base <= 0 or restart_max < restart_base:
+            raise ValueError("invalid restart limits")
+        self.worker = worker
+        self.store = store
+        self.restart_base = float(restart_base)
+        self.restart_max = float(restart_max)
+        self.stable_seconds = float(stable_seconds)
+        self.available = False
+        self.failures = 0
+
+    def _backoff(self) -> float:
+        return min(self.restart_base * (2 ** max(0, self.failures - 1)), self.restart_max)
+
+    async def _start(self, stop_event: asyncio.Event) -> str:
+        """Run one worker generation and return the safe code for why it ended."""
+
+        try:
+            recover = getattr(self.store, "recover_inflight", None)
+            if recover is not None:
+                await store_call(recover)
+        except Exception:
+            return "recovery_failed"
+        started = time.monotonic()
+        self.available = True
+        try:
+            await self.worker.run(stop_event)
+        except Exception:
+            code = "worker_failed"
+        else:
+            code = "worker_exited"
+        finally:
+            self.available = False
+        if time.monotonic() - started >= self.stable_seconds:
+            self.failures = 0
+        return code
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        try:
+            while not stop_event.is_set():
+                code = await self._start(stop_event)
+                if stop_event.is_set():
+                    break
+                self.failures += 1
+                delay = self._backoff()
+                log.error(
+                    "delivery_supervisor code=%s failures=%d restart_in=%.1f",
+                    code,
+                    self.failures,
+                    delay,
+                )
+                try:
+                    async with asyncio.timeout(delay):
+                        await stop_event.wait()
+                except TimeoutError:
+                    pass
+        finally:
+            self.available = False

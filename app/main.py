@@ -25,7 +25,7 @@ from starlette.formparsers import MultiPartException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import Settings
-from .delivery import DeliveryWorker
+from .delivery import DeliverySupervisor, DeliveryWorker, quiet_http_loggers, store_call
 from .store import QueueFull, Store
 
 log = logging.getLogger("index-bridge")
@@ -33,6 +33,10 @@ CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 CLIENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}\Z")
 RECORDED_AT_RE = re.compile(r"[0-9]{13}\Z")
 BODY_READ_TIMEOUT_SECONDS = 10.0
+# Docker probes with a 2 second client timeout.
+HEALTH_TIMEOUT_SECONDS = 1.5
+WORKER_RESTART_BASE_SECONDS = 1.0
+WORKER_RESTART_MAX_SECONDS = 30.0
 _MISSING = object()
 
 
@@ -365,6 +369,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        quiet_http_loggers()
         current_store = application.state.store
         store_owned = current_store is None
         if current_store is None:
@@ -375,41 +380,53 @@ def create_app(
                 max_bytes=application.state.settings.max_bytes,
             )
             application.state.store = current_store
-        recover = getattr(current_store, "recover_inflight", None)
-        if recover is not None:
-            await _maybe_await(recover())
 
         current_worker = application.state.worker
         task: asyncio.Task[Any] | None = None
         stop_event = asyncio.Event()
-        if application.state.start_worker:
-            if current_worker is None:
-                current_worker = _build_worker(application.state.settings, current_store)
-                application.state.worker = current_worker
-            run = getattr(current_worker, "run", None)
-            if run is not None:
-                result = run(stop_event)
-                if inspect.isawaitable(result):
-                    task = asyncio.ensure_future(result)
-        application.state.worker_task = task
         try:
+            if application.state.start_worker:
+                if current_worker is None:
+                    current_worker = _build_worker(application.state.settings, current_store)
+                    application.state.worker = current_worker
+                # The supervisor settles stale in-flight rows before each start.
+                supervisor = DeliverySupervisor(
+                    current_worker,
+                    current_store,
+                    restart_base=WORKER_RESTART_BASE_SECONDS,
+                    restart_max=WORKER_RESTART_MAX_SECONDS,
+                )
+                application.state.supervisor = supervisor
+                task = asyncio.ensure_future(supervisor.run(stop_event))
+            else:
+                recover = getattr(current_store, "recover_inflight", None)
+                if recover is not None:
+                    await store_call(recover)
+            application.state.worker_task = task
             yield
         finally:
             stop_event.set()
-            if task is not None:
-                try:
+            try:
+                if task is not None:
                     grace = max(30.0, application.state.settings.request_timeout_seconds + 5)
-                    await asyncio.wait_for(asyncio.shield(task), timeout=grace)
-                except asyncio.TimeoutError:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-            close_worker = getattr(current_worker, "close", None)
-            if close_worker is not None:
-                await _maybe_await(close_worker())
-            if store_owned:
-                close_store = getattr(current_store, "close", None)
-                if close_store is not None:
-                    await _maybe_await(close_store())
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+                    except asyncio.TimeoutError:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    except Exception:
+                        log.error("shutdown_error code=delivery_supervisor_failed")
+            finally:
+                try:
+                    close_worker = getattr(current_worker, "close", None)
+                    if close_worker is not None:
+                        await _maybe_await(close_worker())
+                except Exception:
+                    log.error("shutdown_error code=worker_close_failed")
+                finally:
+                    close_store = getattr(current_store, "close", None)
+                    if store_owned and close_store is not None:
+                        await store_call(close_store)
 
     application = FastAPI(
         title="Pebble Index Bridge",
@@ -425,6 +442,8 @@ def create_app(
     application.state.start_worker = start_worker
     application.state.tracker = tracker
     application.state.worker_task = None
+    application.state.supervisor = None
+    application.state.health_probe = None
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
     application.add_middleware(
         StreamedBodyLimitMiddleware,
@@ -454,16 +473,44 @@ def create_app(
             await tracker.auth_failure()
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+    def delivery_available() -> bool:
+        if application.state.store is None:
+            return False
+        if not application.state.start_worker:
+            return True
+        supervisor = application.state.supervisor
+        task = application.state.worker_task
+        return (
+            supervisor is not None and supervisor.available and task is not None and not task.done()
+        )
+
+    async def store_op(
+        operation: str, function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Call the store off the event loop; storage faults become a safe 503."""
+
+        try:
+            return await store_call(function, *args, **kwargs)
+        except QueueFull:
+            raise
+        except Exception:
+            log.error("store_error op=%s", operation)
+            raise HTTPException(status_code=503, detail="Queue unavailable") from None
+
     @application.get("/health")
     async def health() -> JSONResponse:
         current_store = application.state.store
         try:
-            if current_store is None:
-                raise RuntimeError("store is not initialized")
-            await _maybe_await(current_store.counts())
-            task = application.state.worker_task
-            if application.state.start_worker and (task is None or task.done()):
-                raise RuntimeError("delivery worker is not running")
+            if current_store is None or not delivery_available():
+                raise RuntimeError("delivery unavailable")
+            # One probe at a time, so a held database lock cannot pile up threads.
+            probe = application.state.health_probe
+            if probe is None or probe.done():
+                probe = asyncio.ensure_future(store_call(current_store.counts))
+                probe.add_done_callback(lambda done: done.cancelled() or done.exception())
+                application.state.health_probe = probe
+            async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
+                await asyncio.shield(probe)
         except Exception:
             return JSONResponse({"status": "unavailable"}, status_code=503)
         return JSONResponse({"status": "ok"})
@@ -471,6 +518,8 @@ def create_app(
     @application.post("/index")
     async def index_webhook(request: Request) -> JSONResponse:
         await authenticate(request)
+        if not delivery_available():
+            raise HTTPException(status_code=503, detail="Delivery unavailable")
         if not await tracker.accept_or_reject():
             raise HTTPException(status_code=429, detail="Too many requests")
         try:
@@ -529,8 +578,12 @@ def create_app(
             "capture client=%s recordedAt=%s chars=%d", client_name, recorded_at, len(transcription)
         )
         try:
-            receipt = await _maybe_await(
-                application.state.store.enqueue(transcription, recorded_at, client_name)
+            receipt = await store_op(
+                "enqueue",
+                application.state.store.enqueue,
+                transcription,
+                recorded_at,
+                client_name,
             )
         except QueueFull:
             log.warning("security_event=queue_capacity_reached")
@@ -540,10 +593,15 @@ def create_app(
     @application.get("/status")
     async def status(request: Request) -> dict[str, Any]:
         await authenticate(request)
-        recent = await _maybe_await(application.state.store.list_recent(limit=20))
-        counts = await _maybe_await(application.state.store.counts())
+        current_store = application.state.store
+        recent = await store_op("list_recent", current_store.list_recent, limit=20)
+        counts = await store_op("counts", current_store.counts)
+        head = await store_op("head", current_store.head)
+        capacity = await store_op("capacity", current_store.capacity)
         return {
             "counts": _counts_metadata(counts),
+            "capacity": _counts_metadata(capacity),
+            "head": None if head is None else _public_metadata(head),
             "recent": [_public_metadata(item) for item in recent],
         }
 
@@ -552,7 +610,7 @@ def create_app(
         await authenticate(request)
         if not re.fullmatch(r"[a-f0-9]{64}", event_id):
             raise HTTPException(status_code=404, detail="Not found")
-        record = await _maybe_await(application.state.store.get(event_id))
+        record = await store_op("get", application.state.store.get, event_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Not found")
         return _public_metadata(record)
