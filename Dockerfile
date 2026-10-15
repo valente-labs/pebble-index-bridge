@@ -7,7 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN python -m pip install --no-cache-dir --require-hashes -r requirements.txt
+# pip is install-time only. Removing it drops its vendored urllib3/msgpack, which
+# Trivy flags HIGH on the 3.14 base, and leaves no package installer at runtime.
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements.txt \
+    && python -m pip uninstall --yes pip
 COPY app ./app
 COPY scripts ./scripts
 
